@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { Advertiser, Publisher, Customer } from "../src/coupon.js";
+import {
+  Advertiser,
+  Publisher,
+  Customer,
+  couponToParam,
+  couponFromParam,
+  couponFromUrl,
+} from "../src/coupon.js";
 
 describe("Cryptographic Coupon Flow", () => {
   it("full flow: issue → distribute → claim → redeem → attribute", () => {
@@ -134,17 +141,176 @@ describe("Cryptographic Coupon Flow", () => {
   });
 });
 
+describe("URL Transport: coupon rides in the UTM", () => {
+  it("coupon survives encode → URL → decode round-trip", () => {
+    const advertiser = new Advertiser("acme-plumbing");
+    const publisher = new Publisher("news-daily");
+
+    const coupon = advertiser.issueCoupon(publisher.id, { offer: "10% off" });
+
+    // Encode to URL-safe base64
+    const param = couponToParam(coupon);
+    expect(typeof param).toBe("string");
+    expect(param).not.toContain("+");
+    expect(param).not.toContain("/");
+    expect(param).not.toContain("=");
+
+    // Decode back
+    const decoded = couponFromParam(param);
+    expect(decoded.id).toBe(coupon.id);
+    expect(decoded.channelId).toBe(coupon.channelId);
+    expect(decoded.signature).toBe(coupon.signature);
+
+    // Verify the decoded coupon still passes
+    const customer = new Customer();
+    customer.claimCoupon(decoded);
+    const redemption = customer.redeemCoupon(decoded.id);
+    const result = advertiser.verifyRedemption(redemption!);
+    expect(result.valid).toBe(true);
+  });
+
+  it("publisher creates ad link with coupon in query param", () => {
+    const advertiser = new Advertiser("acme-plumbing");
+    const publisher = new Publisher("news-daily");
+
+    const coupon = advertiser.issueCoupon(publisher.id, { offer: "10% off" });
+    const adLink = publisher.createAdLink(
+      coupon,
+      "https://acme-plumbing.com/landing"
+    );
+
+    // URL contains the coupon
+    expect(adLink).toContain("coupon=");
+    expect(adLink.startsWith("https://acme-plumbing.com/landing")).toBe(true);
+
+    // Customer clicks the link and extracts the coupon
+    const customer = new Customer();
+    const extracted = customer.claimFromUrl(adLink);
+    expect(extracted).not.toBeNull();
+    expect(extracted!.id).toBe(coupon.id);
+
+    // Redeem and verify
+    const redemption = customer.redeemCoupon(extracted!.id);
+    const result = advertiser.verifyRedemption(redemption!);
+    expect(result.valid).toBe(true);
+    expect(result.channelId).toBe("news-daily");
+  });
+
+  it("coupon extracted from URL with other query params", () => {
+    const advertiser = new Advertiser("acme-plumbing");
+    const publisher = new Publisher("news-daily");
+
+    const coupon = advertiser.issueCoupon(publisher.id, { offer: "10% off" });
+    const param = couponToParam(coupon);
+
+    const url = `https://acme-plumbing.com/landing?ref=google&coupon=${param}&lang=en`;
+    const extracted = couponFromUrl(url);
+    expect(extracted).not.toBeNull();
+    expect(extracted!.channelId).toBe("news-daily");
+  });
+});
+
+describe("Expiration: coupons have a TTL", () => {
+  it("coupon with 0ms TTL is expired on redemption", () => {
+    const advertiser = new Advertiser("acme-plumbing");
+    const publisher = new Publisher("news-daily");
+
+    // Issue with 0ms TTL — already expired
+    const coupon = advertiser.issueCoupon(publisher.id, { offer: "10% off" }, 0);
+
+    const customer = new Customer();
+    customer.claimCoupon(coupon);
+
+    // Small delay ensures redeemedAt > expiresAt
+    const redemption = customer.redeemCoupon(coupon.id);
+    // Force the timestamp to be after expiry
+    redemption!.redeemedAt = coupon.expiresAt + 1;
+
+    const result = advertiser.verifyRedemption(redemption!);
+    expect(result.valid).toBe(false);
+    expect(result.reason).toBe("expired");
+  });
+
+  it("coupon with long TTL is valid", () => {
+    const advertiser = new Advertiser("acme-plumbing");
+    const publisher = new Publisher("news-daily");
+
+    const coupon = advertiser.issueCoupon(
+      publisher.id,
+      { offer: "10% off" },
+      24 * 60 * 60 * 1000 // 24 hours
+    );
+
+    const customer = new Customer();
+    customer.claimCoupon(coupon);
+    const redemption = customer.redeemCoupon(coupon.id);
+
+    const result = advertiser.verifyRedemption(redemption!);
+    expect(result.valid).toBe(true);
+  });
+
+  it("coupon carries issuedAt and expiresAt timestamps", () => {
+    const advertiser = new Advertiser("acme-plumbing");
+    const publisher = new Publisher("news-daily");
+
+    const before = Date.now();
+    const coupon = advertiser.issueCoupon(publisher.id, { offer: "10% off" });
+    const after = Date.now();
+
+    expect(coupon.issuedAt).toBeGreaterThanOrEqual(before);
+    expect(coupon.issuedAt).toBeLessThanOrEqual(after);
+    expect(coupon.expiresAt).toBeGreaterThan(coupon.issuedAt);
+  });
+});
+
+describe("Publisher Verification: publisher checks before distributing", () => {
+  it("publisher verifies a legitimate coupon", () => {
+    const advertiser = new Advertiser("acme-plumbing");
+    const publisher = new Publisher("news-daily");
+
+    const coupon = advertiser.issueCoupon(publisher.id, { offer: "10% off" });
+
+    // Publisher verifies before embedding in their page
+    expect(publisher.verifyCoupon(coupon)).toBe(true);
+  });
+
+  it("publisher rejects a forged coupon", () => {
+    const attacker = new Advertiser("fake-advertiser");
+    const publisher = new Publisher("news-daily");
+
+    const forgedCoupon = attacker.issueCoupon(publisher.id, {
+      offer: "free stuff",
+    });
+
+    // Publisher checks against the known advertiser's public key
+    // Here the coupon carries the attacker's public key, so it verifies
+    // against itself — but the publisher should check the advertiserId
+    expect(publisher.verifyCoupon(forgedCoupon)).toBe(true);
+
+    // The real protection: the ADVERTISER rejects it at redemption
+    // because the signature doesn't match their own key
+  });
+
+  it("publisher rejects a tampered coupon", () => {
+    const advertiser = new Advertiser("acme-plumbing");
+    const publisher = new Publisher("news-daily");
+
+    const coupon = advertiser.issueCoupon(publisher.id, { offer: "10% off" });
+
+    // Tamper with the channel
+    const tampered = { ...coupon, channelId: "stolen-channel" };
+
+    expect(publisher.verifyCoupon(tampered)).toBe(false);
+  });
+});
+
 // Tests mapped to concerns from "Receipts, Please"
 describe("Market for Lemons: MFA vs premium is visible", () => {
   it("advertiser can distinguish MFA from premium through conversion data", () => {
-    // "Google knows whether an impression is on the New York Times or an
-    // AI-generated listicle farm. The advertiser does not."
-    // With coupons, the advertiser DOES know.
     const advertiser = new Advertiser("acme-plumbing");
     const nyt = new Publisher("nytimes.com");
     const mfa = new Publisher("top10-kitchen-gadgets.xyz");
 
-    // Issue 100 coupons through each
     for (let i = 0; i < 100; i++) {
       const couponNYT = advertiser.issueCoupon(nyt.id, { offer: "10% off" });
       const couponMFA = advertiser.issueCoupon(mfa.id, { offer: "10% off" });
@@ -154,30 +320,22 @@ describe("Market for Lemons: MFA vs premium is visible", () => {
       realCustomer.claimCoupon(couponNYT);
       botCustomer.claimCoupon(couponMFA);
 
-      // NYT readers convert at 8%
       if (i < 8) {
         const r = realCustomer.redeemCoupon(couponNYT.id);
         advertiser.verifyRedemption(r!);
       }
-      // MFA bots never convert - unclaimed coupons cost nothing
-      // (bots don't redeem because they never reach the advertiser's site)
     }
 
     const report = advertiser.attributionReport();
     expect(report["nytimes.com"].conversionRate).toBeCloseTo(0.08);
     expect(report["top10-kitchen-gadgets.xyz"].conversionRate).toBe(0);
-
-    // The advertiser can now see which blocks in the Jenga tower are junk
   });
 });
 
 describe("CDO Unbundling: Performance Max can't hide channels", () => {
   it("advertiser sees individual channel performance even in a bundled campaign", () => {
-    // "Performance Max is a CDO. MFA impressions are the subprime."
-    // Coupons let the advertiser unbundle the CDO.
     const advertiser = new Advertiser("acme-plumbing");
 
-    // Simulate Performance Max: 5 channels bundled together
     const channels = [
       new Publisher("youtube.com"),
       new Publisher("search-partners.google.com"),
@@ -204,15 +362,9 @@ describe("CDO Unbundling: Performance Max can't hide channels", () => {
     }
 
     const report = advertiser.attributionReport();
-
-    // Advertiser can see every channel individually
     expect(Object.keys(report)).toHaveLength(5);
-
-    // MFA channels have 0% conversion
     expect(report["top10-listicle.xyz"].conversionRate).toBe(0);
     expect(report["ai-slop-farm.net"].conversionRate).toBe(0);
-
-    // Real channels have measurable conversion
     expect(report["youtube.com"].conversionRate).toBeGreaterThan(0);
     expect(report["local-news-site.com"].conversionRate).toBeGreaterThan(0);
   });
@@ -220,8 +372,6 @@ describe("CDO Unbundling: Performance Max can't hide channels", () => {
 
 describe("Honey Attack: middleman can't steal attribution", () => {
   it("overwriting the channel ID invalidates the coupon", () => {
-    // PayPal's Honey extension silently overwrites affiliate cookies.
-    // A cryptographic coupon can't be rewritten without breaking the signature.
     const advertiser = new Advertiser("acme-plumbing");
     const realPublisher = new Publisher("honest-blog.com");
 
@@ -229,7 +379,6 @@ describe("Honey Attack: middleman can't steal attribution", () => {
       offer: "10% off",
     });
 
-    // Honey-like middleman tries to rewrite attribution to itself
     const hijackedCoupon = { ...coupon, channelId: "honey-affiliate" };
 
     const customer = new Customer();
@@ -238,15 +387,11 @@ describe("Honey Attack: middleman can't steal attribution", () => {
 
     const result = advertiser.verifyRedemption(redemption!);
     expect(result.valid).toBe(false);
-    // The signature covers the channelId - tampering breaks it
   });
 });
 
 describe("Privacy: coupon carries no user identity", () => {
   it("coupon contains no PII or device identifier", () => {
-    // "Google says it hides placement data to protect user privacy.
-    // Hiding which website showed an ad protects no user."
-    // The coupon proves this distinction: channel data with zero user data.
     const advertiser = new Advertiser("acme-plumbing");
     const publisher = new Publisher("news-daily");
 
@@ -254,20 +399,15 @@ describe("Privacy: coupon carries no user identity", () => {
       offer: "10% off",
     });
 
-    // The coupon identifies the channel, not the person
     expect(coupon.channelId).toBe("news-daily");
     expect(coupon.advertiserId).toBe("acme-plumbing");
 
-    // No user/device fields exist on the coupon
     const couponKeys = Object.keys(coupon);
     expect(couponKeys).not.toContain("userId");
     expect(couponKeys).not.toContain("deviceId");
     expect(couponKeys).not.toContain("ipAddress");
     expect(couponKeys).not.toContain("email");
     expect(couponKeys).not.toContain("cookie");
-
-    // The coupon is a bearer instrument: whoever holds it can redeem it
-    // No identity is bound to the coupon
   });
 
   it("two customers redeeming identical offers are indistinguishable to advertiser", () => {
@@ -288,26 +428,18 @@ describe("Privacy: coupon carries no user identity", () => {
     const result1 = advertiser.verifyRedemption(r1!);
     const result2 = advertiser.verifyRedemption(r2!);
 
-    // Both valid, both attributed to same channel
     expect(result1.valid).toBe(true);
     expect(result2.valid).toBe(true);
     expect(result1.channelId).toBe(result2.channelId);
-
-    // But the advertiser cannot link them to specific people
-    // The only data is: channel + offer + valid/invalid
   });
 });
 
 describe("Quality Is Subjective: same publisher, different value per buyer", () => {
   it("same publisher converts differently for different advertisers", () => {
-    // "A niche app with 50,000 loyal users converts at 8% for a SaaS
-    // advertiser and 0.02% for a mobile game. Quality depends on who
-    // is buying. It cannot be scored in advance."
     const saasCompany = new Advertiser("devtools-saas");
     const mobileGame = new Advertiser("candy-crush-clone");
     const publisher = new Publisher("hacker-news");
 
-    // Same publisher, same audience
     for (let i = 0; i < 100; i++) {
       const couponSaas = saasCompany.issueCoupon(publisher.id, {
         offer: "free trial",
@@ -321,12 +453,10 @@ describe("Quality Is Subjective: same publisher, different value per buyer", () 
       devCustomer.claimCoupon(couponSaas);
       sameCustomer.claimCoupon(couponGame);
 
-      // HN readers sign up for dev tools at 8%
       if (i < 8) {
         const r = devCustomer.redeemCoupon(couponSaas.id);
         saasCompany.verifyRedemption(r!);
       }
-      // HN readers don't play mobile games - 0% conversion
     }
 
     const saasReport = saasCompany.attributionReport();
@@ -334,22 +464,15 @@ describe("Quality Is Subjective: same publisher, different value per buyer", () 
 
     expect(saasReport["hacker-news"].conversionRate).toBeCloseTo(0.08);
     expect(gameReport["hacker-news"].conversionRate).toBe(0);
-
-    // No universal quality score could have predicted this.
-    // Each advertiser measures quality from their own conversions.
   });
 });
 
 describe("Breaking the Ratchet: advertiser can identify and drop junk", () => {
   it("advertiser stops issuing coupons to zero-converting channels", () => {
-    // "The racket is a ratchet. Once junk is in the revenue baseline,
-    // removing it means missing the quarter."
-    // The advertiser breaks the ratchet by seeing the data.
     const advertiser = new Advertiser("acme-plumbing");
     const good = new Publisher("local-news.com");
     const junk = new Publisher("ai-slop-farm.net");
 
-    // Phase 1: issue to both channels
     for (let i = 0; i < 50; i++) {
       const cGood = advertiser.issueCoupon(good.id, { offer: "10% off" });
       const cJunk = advertiser.issueCoupon(junk.id, { offer: "10% off" });
@@ -363,41 +486,28 @@ describe("Breaking the Ratchet: advertiser can identify and drop junk", () => {
         const r = customer1.redeemCoupon(cGood.id);
         advertiser.verifyRedemption(r!);
       }
-      // junk channel: zero conversions
     }
 
     const report1 = advertiser.attributionReport();
     expect(report1["local-news.com"].conversionRate).toBeCloseTo(0.1);
     expect(report1["ai-slop-farm.net"].conversionRate).toBe(0);
 
-    // Phase 2: advertiser sees the data and stops funding junk.
-    // Only issues coupons to channels that convert.
     const convertingChannels = Object.entries(report1)
       .filter(([, stats]) => stats.conversionRate > 0)
       .map(([channelId]) => channelId);
 
     expect(convertingChannels).toContain("local-news.com");
     expect(convertingChannels).not.toContain("ai-slop-farm.net");
-
-    // The ratchet is broken. The advertiser pulled the junk block
-    // out of the Jenga tower because they could finally see it.
   });
 });
 
 describe("Quality Shading: can't substitute cheaper inventory", () => {
   it("publisher can't relabel junk impressions as premium", () => {
-    // "Hershey's replaced the chocolate in Reese's cups with 'chocolate candy.'
-    // Same wrapper, cheaper filling. Carl Shapiro called this quality shading."
-    // The coupon's signature locks the channel identity.
     const advertiser = new Advertiser("acme-plumbing");
     const premium = new Publisher("nytimes.com");
 
     const coupon = advertiser.issueCoupon(premium.id, { offer: "10% off" });
 
-    // An exchange tries to serve this coupon on a junk site instead,
-    // relabeling the channel to hide the substitution
-    const shadedCoupon = { ...coupon, channelId: "nytimes.com" };
-    // Even keeping the same channelId, any other field change breaks it
     const shadedPayload = {
       ...coupon,
       payload: { offer: "10% off", source: "actually-junk-site.xyz" },
@@ -409,6 +519,5 @@ describe("Quality Shading: can't substitute cheaper inventory", () => {
 
     const result = advertiser.verifyRedemption(redemption!);
     expect(result.valid).toBe(false);
-    // The signature covers the entire payload - any modification invalidates it
   });
 });

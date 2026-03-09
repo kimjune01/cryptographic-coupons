@@ -18,8 +18,10 @@
   "license": "MIT",
   "packageManager": "pnpm@10.24.0",
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/node": "^25.3.5",
     "esbuild": "^0.27.3",
+    "playwright": "^1.58.2",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
   }

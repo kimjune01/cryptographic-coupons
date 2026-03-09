@@ -3,6 +3,7 @@ import {
   sign,
   verify,
   createHash,
+  createPublicKey,
   type KeyObject,
 } from "node:crypto";
 
@@ -11,11 +12,16 @@ export interface CouponPayload {
   [key: string]: unknown;
 }
 
-export interface Coupon {
+export interface CouponData {
   id: string;
   advertiserId: string;
   channelId: string;
   payload: CouponPayload;
+  issuedAt: number;
+  expiresAt: number;
+}
+
+export interface Coupon extends CouponData {
   signature: string;
   publicKey: string;
 }
@@ -39,11 +45,12 @@ export interface ChannelReport {
   conversionRate: number;
 }
 
+const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 export class Advertiser {
   readonly id: string;
   private privateKey: KeyObject;
   private publicKey: KeyObject;
-  private issuedCoupons: Map<string, { channelId: string }> = new Map();
   private redeemedCoupons: Set<string> = new Set();
   private channelStats: Map<
     string,
@@ -57,17 +64,33 @@ export class Advertiser {
     this.privateKey = privateKey;
   }
 
-  issueCoupon(channelId: string, payload: CouponPayload): Coupon {
+  getPublicKeyPem(): string {
+    return this.publicKey.export({ type: "spki", format: "pem" }).toString();
+  }
+
+  issueCoupon(
+    channelId: string,
+    payload: CouponPayload,
+    ttlMs: number = DEFAULT_TTL_MS
+  ): Coupon {
+    const now = Date.now();
     const id = createHash("sha256")
-      .update(`${this.id}:${channelId}:${Date.now()}:${Math.random()}`)
+      .update(`${this.id}:${channelId}:${now}:${Math.random()}`)
       .digest("hex");
 
-    const message = this.serializeCouponData(id, this.id, channelId, payload);
+    const data: CouponData = {
+      id,
+      advertiserId: this.id,
+      channelId,
+      payload,
+      issuedAt: now,
+      expiresAt: now + ttlMs,
+    };
+
+    const message = serializeCouponData(data);
     const signature = sign(null, Buffer.from(message), this.privateKey).toString(
       "base64"
     );
-
-    this.issuedCoupons.set(id, { channelId });
 
     const stats = this.channelStats.get(channelId) ?? {
       issued: 0,
@@ -77,33 +100,33 @@ export class Advertiser {
     this.channelStats.set(channelId, stats);
 
     return {
-      id,
-      advertiserId: this.id,
-      channelId,
-      payload,
+      ...data,
       signature,
-      publicKey: this.publicKey
-        .export({ type: "spki", format: "pem" })
-        .toString(),
+      publicKey: this.getPublicKeyPem(),
     };
   }
 
   verifyRedemption(redemption: Redemption): Attribution {
     const { coupon } = redemption;
 
-    // Check double redemption
     if (this.redeemedCoupons.has(coupon.id)) {
       return { valid: false, reason: "already redeemed" };
     }
 
-    // Verify the signature using our own public key
-    const message = this.serializeCouponData(
-      coupon.id,
-      coupon.advertiserId,
-      coupon.channelId,
-      coupon.payload
-    );
+    if (redemption.redeemedAt > coupon.expiresAt) {
+      return { valid: false, reason: "expired" };
+    }
 
+    const data: CouponData = {
+      id: coupon.id,
+      advertiserId: coupon.advertiserId,
+      channelId: coupon.channelId,
+      payload: coupon.payload,
+      issuedAt: coupon.issuedAt,
+      expiresAt: coupon.expiresAt,
+    };
+
+    const message = serializeCouponData(data);
     const valid = verify(
       null,
       Buffer.from(message),
@@ -140,15 +163,6 @@ export class Advertiser {
     }
     return report;
   }
-
-  private serializeCouponData(
-    id: string,
-    advertiserId: string,
-    channelId: string,
-    payload: CouponPayload
-  ): string {
-    return JSON.stringify({ id, advertiserId, channelId, payload });
-  }
 }
 
 export class Publisher {
@@ -157,6 +171,34 @@ export class Publisher {
   constructor(id: string) {
     this.id = id;
   }
+
+  /** Publisher verifies the coupon is real before distributing it */
+  verifyCoupon(coupon: Coupon): boolean {
+    const data: CouponData = {
+      id: coupon.id,
+      advertiserId: coupon.advertiserId,
+      channelId: coupon.channelId,
+      payload: coupon.payload,
+      issuedAt: coupon.issuedAt,
+      expiresAt: coupon.expiresAt,
+    };
+    const message = serializeCouponData(data);
+    const pubKey = createPublicKey(coupon.publicKey);
+    return verify(
+      null,
+      Buffer.from(message),
+      pubKey,
+      Buffer.from(coupon.signature, "base64")
+    );
+  }
+
+  /** Publisher embeds the coupon in an ad link URL */
+  createAdLink(coupon: Coupon, landingUrl: string): string {
+    const encoded = couponToParam(coupon);
+    const url = new URL(landingUrl);
+    url.searchParams.set("coupon", encoded);
+    return url.toString();
+  }
 }
 
 export class Customer {
@@ -164,6 +206,15 @@ export class Customer {
 
   claimCoupon(coupon: Coupon): void {
     this.coupons.set(coupon.id, coupon);
+  }
+
+  /** Claim a coupon from a URL (extracts from query param) */
+  claimFromUrl(url: string): Coupon | null {
+    const coupon = couponFromUrl(url);
+    if (coupon) {
+      this.coupons.set(coupon.id, coupon);
+    }
+    return coupon;
   }
 
   redeemCoupon(couponId: string): Redemption | null {
@@ -176,4 +227,38 @@ export class Customer {
       redeemedAt: Date.now(),
     };
   }
+}
+
+// --- URL Transport ---
+
+/** Encode a coupon as a URL-safe base64 string */
+export function couponToParam(coupon: Coupon): string {
+  const json = JSON.stringify(coupon);
+  return Buffer.from(json).toString("base64url");
+}
+
+/** Decode a coupon from a URL-safe base64 string */
+export function couponFromParam(param: string): Coupon {
+  const json = Buffer.from(param, "base64url").toString("utf-8");
+  return JSON.parse(json) as Coupon;
+}
+
+/** Extract a coupon from a URL's ?coupon= query parameter */
+export function couponFromUrl(urlStr: string): Coupon | null {
+  const url = new URL(urlStr);
+  const param = url.searchParams.get("coupon");
+  if (!param) return null;
+  return couponFromParam(param);
+}
+
+/** Serialize coupon data for signing/verification (deterministic) */
+function serializeCouponData(data: CouponData): string {
+  return JSON.stringify({
+    id: data.id,
+    advertiserId: data.advertiserId,
+    channelId: data.channelId,
+    payload: data.payload,
+    issuedAt: data.issuedAt,
+    expiresAt: data.expiresAt,
+  });
 }
