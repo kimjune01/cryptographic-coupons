@@ -10,7 +10,7 @@ This repo is a proof-of-concept for **cryptographically signed coupons**: the ad
 
 ## What it proves
 
-The test suite maps to specific problems in digital advertising ([Receipts, Please](https://kimjune01.github.io/receipts-please)):
+The test suite maps to specific problems in digital advertising ([Receipts, Please](https://www.june.kim/receipts-please)):
 
 | Problem | What the coupon does |
 |---|---|
@@ -65,7 +65,7 @@ This is public-key cryptography, not cryptocurrency. No blockchain, no tokens, n
 
 ## Part of
 
-- [The Coupon Was the SDK](https://kimjune01.github.io/coupon-was-the-sdk) — the economics
-- [Receipts, Please](https://kimjune01.github.io/receipts-please) — the problem
-- [Attested Attribution](https://kimjune01.github.io/attested-attribution) — the protocol
-- [Vector Space](https://kimjune01.github.io/vector-space) — the series
+- [Adtech from 1887](https://www.june.kim/adtech-from-1887) — the economics
+- [Receipts, Please](https://www.june.kim/receipts-please) — the problem
+- [Attested Attribution](https://www.june.kim/attested-attribution) — the protocol
+- [Vector Space](https://www.june.kim/vector-space) — the series
