@@ -1,0 +1,26 @@
+{
+  "name": "cryptographic-coupons",
+  "version": "1.0.0",
+  "description": "Proof-of-concept: advertiser-issued cryptographic coupons for privacy-preserving ad attribution",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "build": "tsc",
+    "demo": "npx tsx src/demo.ts"
+  },
+  "keywords": [
+    "attribution",
+    "cryptography",
+    "advertising",
+    "privacy"
+  ],
+  "author": "kimjune01",
+  "license": "MIT",
+  "packageManager": "pnpm@10.24.0",
+  "devDependencies": {
+    "@types/node": "^25.3.5",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}
